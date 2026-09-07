@@ -152,6 +152,16 @@ def send_telegram(message):
 
 @app.route("/", methods=["GET"])
 def home():
+    return (
+        "cTrader notification service is running",
+        200
+    )
+
+
+# ============================================================
+# TEST TELEGRAM NOTIFICATION
+# ============================================================
+
 @app.route("/test", methods=["GET"])
 def test_notification():
     success, result = send_telegram(
@@ -159,14 +169,15 @@ def test_notification():
     )
 
     if success:
-        return "Test notification sent successfully", 200
+        return (
+            "Test notification sent successfully",
+            200
+        )
 
-    return f"Test notification failed: {result}", 500
     return (
-        "cTrader notification service is running",
-        200
+        "Test notification failed: " + str(result),
+        500
     )
-
 
 # ============================================================
 # EXISTING NOTIFY ENDPOINT
