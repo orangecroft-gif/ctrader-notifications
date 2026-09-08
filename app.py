@@ -42,8 +42,8 @@ CTRADER_TOKEN_URL = (
 # ============================================================
 
 WATCHED_LABEL_PREFIXES = (
-    "BTCUSD_MomentumTrend",
-    "XAUUSD_MomentumHunter"
+    "BTCUSD_MomentumTrend_V7_6",
+    "XAUUSD_Breakout_V1"
 )
 
 
