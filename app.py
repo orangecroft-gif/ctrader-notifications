@@ -6,20 +6,9 @@ import requests
 from flask import Flask, request, jsonify, redirect
 
 from ctrader_open_api import Client, Protobuf, TcpProtocol, EndPoints
-
-from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import (
-    ProtoHeartbeatEvent
-)
-
+from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import *
 from ctrader_open_api.messages.OpenApiMessages_pb2 import *
 from ctrader_open_api.messages.OpenApiModelMessages_pb2 import *
-
-from twisted.internet import reactor
-
-
-# ============================================================
-# FLASK
-# ============================================================
 
 app = Flask(__name__)
 
@@ -33,20 +22,6 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 CTRADER_CLIENT_ID = os.environ.get("CTRADER_CLIENT_ID")
 CTRADER_CLIENT_SECRET = os.environ.get("CTRADER_CLIENT_SECRET")
-
-# Optional.
-#
-# Once you have authorised cTrader, you can place your refresh
-# token in Render as:
-#
-# CTRADER_REFRESH_TOKEN
-#
-# This allows the service to try reconnecting automatically
-# after a Render restart.
-#
-CTRADER_REFRESH_TOKEN_ENV = os.environ.get(
-    "CTRADER_REFRESH_TOKEN"
-)
 
 CTRADER_REDIRECT_URI = os.environ.get(
     "CTRADER_REDIRECT_URI",
@@ -63,7 +38,7 @@ CTRADER_TOKEN_URL = (
 
 
 # ============================================================
-# BOT LABEL PREFIXES TO WATCH
+# WATCHED BOT LABELS
 # ============================================================
 
 WATCHED_LABEL_PREFIXES = (
@@ -73,29 +48,26 @@ WATCHED_LABEL_PREFIXES = (
 
 
 # ============================================================
-# GLOBAL RUNTIME STATE
+# GLOBAL STATE
 # ============================================================
 
 CTRADER_ACCESS_TOKEN = None
-CTRADER_REFRESH_TOKEN = CTRADER_REFRESH_TOKEN_ENV
+CTRADER_REFRESH_TOKEN = os.environ.get("CTRADER_REFRESH_TOKEN")
 
 ctrader_client = None
 
 watcher_thread = None
 watcher_started = False
 watcher_connected = False
-
 application_authorized = False
 
 authorized_accounts = set()
-
 symbol_maps = {}
-
 notified_deals = set()
 
-last_message_time = None
-last_heartbeat_time = None
 last_connection_time = None
+last_message_time = None
+last_error = None
 
 state_lock = threading.Lock()
 
@@ -107,22 +79,12 @@ state_lock = threading.Lock()
 def send_telegram(message):
 
     if not TELEGRAM_BOT_TOKEN:
-
-        print("TELEGRAM_BOT_TOKEN missing")
-
-        return (
-            False,
-            "TELEGRAM_BOT_TOKEN missing"
-        )
+        print("TELEGRAM_BOT_TOKEN missing", flush=True)
+        return False, "TELEGRAM_BOT_TOKEN missing"
 
     if not TELEGRAM_CHAT_ID:
-
-        print("TELEGRAM_CHAT_ID missing")
-
-        return (
-            False,
-            "TELEGRAM_CHAT_ID missing"
-        )
+        print("TELEGRAM_CHAT_ID missing", flush=True)
+        return False, "TELEGRAM_CHAT_ID missing"
 
     url = (
         "https://api.telegram.org/bot"
@@ -144,15 +106,8 @@ def send_telegram(message):
         )
 
         if response.ok:
-
-            print(
-                "Telegram notification sent"
-            )
-
-            return (
-                True,
-                "Notification sent"
-            )
+            print("Telegram notification sent", flush=True)
+            return True, "Notification sent"
 
         error_text = (
             "Telegram error "
@@ -161,24 +116,19 @@ def send_telegram(message):
             + response.text
         )
 
-        print(error_text)
+        print(error_text, flush=True)
 
-        return (
-            False,
-            error_text
-        )
+        return False, error_text
 
     except Exception as exc:
 
         print(
             "Telegram exception:",
-            str(exc)
+            str(exc),
+            flush=True
         )
 
-        return (
-            False,
-            str(exc)
-        )
+        return False, str(exc)
 
 
 # ============================================================
@@ -195,7 +145,7 @@ def home():
 
 
 # ============================================================
-# TEST TELEGRAM
+# TELEGRAM TEST
 # ============================================================
 
 @app.route("/test", methods=["GET"])
@@ -206,21 +156,16 @@ def test_notification():
     )
 
     if success:
-
-        return (
-            "Test notification sent successfully",
-            200
-        )
+        return "Test notification sent successfully", 200
 
     return (
-        "Test notification failed: "
-        + str(result),
+        "Test notification failed: " + str(result),
         500
     )
 
 
 # ============================================================
-# LEGACY /notify ENDPOINT
+# LEGACY NOTIFY ENDPOINT
 # ============================================================
 
 @app.route("/notify", methods=["POST"])
@@ -228,25 +173,18 @@ def notify():
 
     try:
 
-        data = request.get_json(
-            silent=True
-        ) or {}
+        data = request.get_json(silent=True) or {}
 
-        message = data.get(
-            "message"
-        )
+        message = data.get("message")
 
         if not message:
 
             return jsonify({
                 "success": False,
-                "message":
-                    "No message supplied"
+                "message": "No message supplied"
             }), 400
 
-        success, result = send_telegram(
-            message
-        )
+        success, result = send_telegram(message)
 
         if success:
 
@@ -272,10 +210,7 @@ def notify():
 # CTRADER LOGIN
 # ============================================================
 
-@app.route(
-    "/ctrader/login",
-    methods=["GET"]
-)
+@app.route("/ctrader/login", methods=["GET"])
 def ctrader_login():
 
     if not CTRADER_CLIENT_ID:
@@ -286,17 +221,10 @@ def ctrader_login():
         )
 
     params = {
-        "client_id":
-            CTRADER_CLIENT_ID,
-
-        "redirect_uri":
-            CTRADER_REDIRECT_URI,
-
-        "scope":
-            "accounts",
-
-        "product":
-            "web"
+        "client_id": CTRADER_CLIENT_ID,
+        "redirect_uri": CTRADER_REDIRECT_URI,
+        "scope": "accounts",
+        "product": "web"
     }
 
     prepared = requests.Request(
@@ -305,27 +233,20 @@ def ctrader_login():
         params=params
     ).prepare()
 
-    return redirect(
-        prepared.url
-    )
+    return redirect(prepared.url)
 
 
 # ============================================================
-# CTRADER OAUTH CALLBACK
+# CTRADER CALLBACK
 # ============================================================
 
-@app.route(
-    "/callback",
-    methods=["GET"]
-)
+@app.route("/callback", methods=["GET"])
 def ctrader_callback():
 
     global CTRADER_ACCESS_TOKEN
     global CTRADER_REFRESH_TOKEN
 
-    code = request.args.get(
-        "code"
-    )
+    code = request.args.get("code")
 
     if not code:
 
@@ -334,99 +255,65 @@ def ctrader_callback():
             400
         )
 
-    if not CTRADER_CLIENT_ID:
-
-        return (
-            "CTRADER_CLIENT_ID is not configured.",
-            500
-        )
-
-    if not CTRADER_CLIENT_SECRET:
-
-        return (
-            "CTRADER_CLIENT_SECRET is not configured.",
-            500
-        )
-
     try:
+
+        print(
+            "Exchanging cTrader authorisation code...",
+            flush=True
+        )
 
         token_response = requests.get(
             CTRADER_TOKEN_URL,
             params={
-                "grant_type":
-                    "authorization_code",
-
-                "code":
-                    code,
-
-                "redirect_uri":
-                    CTRADER_REDIRECT_URI,
-
-                "client_id":
-                    CTRADER_CLIENT_ID,
-
-                "client_secret":
-                    CTRADER_CLIENT_SECRET
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": CTRADER_REDIRECT_URI,
+                "client_id": CTRADER_CLIENT_ID,
+                "client_secret": CTRADER_CLIENT_SECRET
             },
             timeout=20
         )
 
         data = token_response.json()
 
-        access_token = data.get(
-            "accessToken"
-        )
-
-        refresh_token = data.get(
-            "refreshToken"
-        )
+        access_token = data.get("accessToken")
+        refresh_token = data.get("refreshToken")
 
         if not access_token:
 
             print(
                 "Token exchange failed:",
-                data
+                data,
+                flush=True
             )
 
             return (
-                "cTrader token exchange failed.<br><br>"
-                + str(data),
+                "cTrader token exchange failed.",
                 400
             )
 
-        CTRADER_ACCESS_TOKEN = (
-            access_token
-        )
+        CTRADER_ACCESS_TOKEN = access_token
 
         if refresh_token:
-
-            CTRADER_REFRESH_TOKEN = (
-                refresh_token
-            )
+            CTRADER_REFRESH_TOKEN = refresh_token
 
         print(
-            "cTrader OAuth token received"
-        )
-
-        print(
-            "Refresh token received:",
-            bool(
-                CTRADER_REFRESH_TOKEN
-            )
+            "cTrader OAuth token received",
+            flush=True
         )
 
         start_ctrader_watcher()
 
         send_telegram(
-            "✅ cTrader Open API authorised\n\n"
-            "Trade watcher is starting.\n"
-            "Access: account monitoring"
+            "✅ cTrader authorised\n\n"
+            "Open API trade watcher is starting."
         )
 
         return (
             "<h2>cTrader connected successfully</h2>"
-            "<p>The trade watcher is starting.</p>"
-            "<p>You can close this page.</p>",
+            "<p>The Open API trade watcher is starting.</p>"
+            "<p>Wait about 10 seconds, then open "
+            "/ctrader/status.</p>",
             200
         )
 
@@ -434,7 +321,8 @@ def ctrader_callback():
 
         print(
             "Callback error:",
-            str(exc)
+            repr(exc),
+            flush=True
         )
 
         return (
@@ -445,109 +333,78 @@ def ctrader_callback():
 
 
 # ============================================================
-# REFRESH CTRADER ACCESS TOKEN
+# REFRESH ACCESS TOKEN
 # ============================================================
 
 def refresh_ctrader_token():
 
     global CTRADER_ACCESS_TOKEN
     global CTRADER_REFRESH_TOKEN
+    global last_error
 
     if not CTRADER_REFRESH_TOKEN:
-
-        print(
-            "No cTrader refresh token available"
-        )
-
-        return False
-
-    if not CTRADER_CLIENT_ID:
-
-        print(
-            "CTRADER_CLIENT_ID missing"
-        )
-
-        return False
-
-    if not CTRADER_CLIENT_SECRET:
-
-        print(
-            "CTRADER_CLIENT_SECRET missing"
-        )
-
         return False
 
     try:
 
         print(
-            "Refreshing cTrader access token..."
+            "Refreshing cTrader token...",
+            flush=True
         )
 
         response = requests.get(
             CTRADER_TOKEN_URL,
             params={
-                "grant_type":
-                    "refresh_token",
-
-                "refresh_token":
-                    CTRADER_REFRESH_TOKEN,
-
-                "client_id":
-                    CTRADER_CLIENT_ID,
-
-                "client_secret":
-                    CTRADER_CLIENT_SECRET
+                "grant_type": "refresh_token",
+                "refresh_token": CTRADER_REFRESH_TOKEN,
+                "client_id": CTRADER_CLIENT_ID,
+                "client_secret": CTRADER_CLIENT_SECRET
             },
             timeout=20
         )
 
         data = response.json()
 
-        new_access_token = data.get(
-            "accessToken"
-        )
+        access_token = data.get("accessToken")
+        refresh_token = data.get("refreshToken")
 
-        new_refresh_token = data.get(
-            "refreshToken"
-        )
+        if not access_token:
 
-        if not new_access_token:
-
-            print(
-                "cTrader token refresh failed:",
-                data
+            last_error = (
+                "Token refresh failed: "
+                + str(data)
             )
+
+            print(last_error, flush=True)
 
             return False
 
-        CTRADER_ACCESS_TOKEN = (
-            new_access_token
-        )
+        CTRADER_ACCESS_TOKEN = access_token
 
-        if new_refresh_token:
-
-            CTRADER_REFRESH_TOKEN = (
-                new_refresh_token
-            )
+        if refresh_token:
+            CTRADER_REFRESH_TOKEN = refresh_token
 
         print(
-            "cTrader access token refreshed successfully"
+            "cTrader token refreshed",
+            flush=True
         )
 
         return True
 
     except Exception as exc:
 
-        print(
-            "Token refresh exception:",
-            str(exc)
+        last_error = (
+            "Token refresh exception: "
+            + repr(exc)
         )
+
+        print(last_error, flush=True)
 
         return False
 
 
 # ============================================================
-# START CTRADER WATCHER
+# START WATCHER
 # ============================================================
 
 def start_ctrader_watcher():
@@ -557,73 +414,84 @@ def start_ctrader_watcher():
 
     with state_lock:
 
-        if watcher_started:
+        if watcher_thread is not None and watcher_thread.is_alive():
 
             print(
-                "Watcher already started"
+                "cTrader watcher thread already alive",
+                flush=True
             )
-
-            if (
-                ctrader_client
-                and watcher_connected
-                and CTRADER_ACCESS_TOKEN
-            ):
-
-                try:
-
-                    reactor.callFromThread(
-                        request_account_list
-                    )
-
-                except Exception as exc:
-
-                    print(
-                        "Account list restart error:",
-                        str(exc)
-                    )
 
             return
 
         watcher_started = True
 
-    print(
-        "Starting cTrader watcher thread"
-    )
+        print(
+            "Creating cTrader watcher thread...",
+            flush=True
+        )
 
-    watcher_thread = threading.Thread(
-        target=run_ctrader_watcher,
-        daemon=True
-    )
+        watcher_thread = threading.Thread(
+            target=run_ctrader_watcher,
+            name="ctrader-open-api",
+            daemon=True
+        )
 
-    watcher_thread.start()
+        watcher_thread.start()
+
+        print(
+            "cTrader watcher thread launched",
+            flush=True
+        )
 
 
 # ============================================================
-# CTRADER WATCHER THREAD
+# OPEN API THREAD
 # ============================================================
 
 def run_ctrader_watcher():
 
     global ctrader_client
+    global watcher_connected
+    global application_authorized
+    global last_error
 
     try:
 
+        # IMPORTANT:
+        # Import the reactor inside the Open API thread.
+        from twisted.internet import reactor
+
         print(
-            "Connecting to cTrader LIVE Open API..."
+            "Open API thread entered",
+            flush=True
         )
 
-        host = (
-            EndPoints.PROTOBUF_LIVE_HOST
+        print(
+            "LIVE host:",
+            EndPoints.PROTOBUF_LIVE_HOST,
+            flush=True
         )
 
-        port = (
-            EndPoints.PROTOBUF_PORT
+        print(
+            "Open API port:",
+            EndPoints.PROTOBUF_PORT,
+            flush=True
+        )
+
+        print(
+            "Creating cTrader Client...",
+            flush=True
         )
 
         ctrader_client = Client(
-            host,
-            port,
+            EndPoints.PROTOBUF_LIVE_HOST,
+            EndPoints.PROTOBUF_PORT,
             TcpProtocol
+        )
+
+        print(
+            "cTrader Client created",
+            flush=True
         )
 
         ctrader_client.setConnectedCallback(
@@ -638,62 +506,96 @@ def run_ctrader_watcher():
             on_ctrader_message
         )
 
+        print(
+            "cTrader callbacks installed",
+            flush=True
+        )
+
+        print(
+            "Calling client.startService()...",
+            flush=True
+        )
+
         ctrader_client.startService()
 
         print(
-            "cTrader client service started"
+            "client.startService() returned",
+            flush=True
         )
 
-        reactor.callLater(
-            10,
-            heartbeat_loop
+        print(
+            "Starting Twisted reactor...",
+            flush=True
         )
 
         reactor.run(
             installSignalHandlers=False
         )
 
+        print(
+            "Twisted reactor stopped",
+            flush=True
+        )
+
     except Exception as exc:
 
+        watcher_connected = False
+        application_authorized = False
+
+        last_error = (
+            "Watcher fatal error: "
+            + repr(exc)
+        )
+
         print(
-            "Watcher fatal error:",
-            str(exc)
+            last_error,
+            flush=True
         )
 
 
 # ============================================================
-# CTRADER CONNECTED
+# CONNECTED CALLBACK
 # ============================================================
 
 def on_ctrader_connected(client):
 
     global watcher_connected
     global last_connection_time
+    global last_error
 
     watcher_connected = True
+    last_connection_time = time.time()
+    last_error = None
 
-    last_connection_time = (
-        time.time()
+    print(
+        "======================================",
+        flush=True
     )
 
     print(
-        "Connected to cTrader Open API"
+        "CONNECTED TO CTRADER OPEN API",
+        flush=True
     )
 
-    application_auth = (
+    print(
+        "======================================",
+        flush=True
+    )
+
+    request_message = (
         ProtoOAApplicationAuthReq()
     )
 
-    application_auth.clientId = (
+    request_message.clientId = (
         CTRADER_CLIENT_ID
     )
 
-    application_auth.clientSecret = (
+    request_message.clientSecret = (
         CTRADER_CLIENT_SECRET
     )
 
     deferred = client.send(
-        application_auth
+        request_message
     )
 
     deferred.addErrback(
@@ -702,88 +604,45 @@ def on_ctrader_connected(client):
 
 
 # ============================================================
-# CTRADER DISCONNECTED
+# DISCONNECTED CALLBACK
 # ============================================================
 
-def on_ctrader_disconnected(
-    client,
-    reason
-):
+def on_ctrader_disconnected(client, reason):
 
     global watcher_connected
     global application_authorized
+    global last_error
 
     watcher_connected = False
     application_authorized = False
 
+    last_error = (
+        "Disconnected: "
+        + str(reason)
+    )
+
     print(
-        "cTrader disconnected:",
-        reason
+        "CTRADER DISCONNECTED:",
+        reason,
+        flush=True
     )
 
 
 # ============================================================
-# CTRADER ERROR
+# ERROR CALLBACK
 # ============================================================
 
 def on_ctrader_error(failure):
 
+    global last_error
+
+    last_error = str(failure)
+
     print(
-        "cTrader API error:",
-        failure
+        "CTRADER API ERROR:",
+        failure,
+        flush=True
     )
-
-
-# ============================================================
-# HEARTBEAT
-# ============================================================
-
-def heartbeat_loop():
-
-    global last_heartbeat_time
-
-    try:
-
-        if (
-            ctrader_client
-            and watcher_connected
-        ):
-
-            heartbeat = (
-                ProtoHeartbeatEvent()
-            )
-
-            deferred = (
-                ctrader_client.send(
-                    heartbeat
-                )
-            )
-
-            deferred.addErrback(
-                on_ctrader_error
-            )
-
-            last_heartbeat_time = (
-                time.time()
-            )
-
-            print(
-                "cTrader heartbeat sent"
-            )
-
-    except Exception as exc:
-
-        print(
-            "Heartbeat error:",
-            str(exc)
-        )
-
-    finally:
-
-        reactor.callLater(
-            10,
-            heartbeat_loop
-        )
 
 
 # ============================================================
@@ -792,23 +651,19 @@ def heartbeat_loop():
 
 def request_account_list():
 
-    if not ctrader_client:
-
-        print(
-            "Cannot request account list - "
-            "client not ready"
-        )
-
-        return
-
     if not CTRADER_ACCESS_TOKEN:
 
         print(
-            "Cannot request account list - "
-            "no access token"
+            "No cTrader access token",
+            flush=True
         )
 
         return
+
+    print(
+        "Requesting authorised account list...",
+        flush=True
+    )
 
     request_message = (
         ProtoOAGetAccountListByAccessTokenReq()
@@ -831,9 +686,13 @@ def request_account_list():
 # AUTHORIZE ACCOUNT
 # ============================================================
 
-def authorize_account(
-    account_id
-):
+def authorize_account(account_id):
+
+    print(
+        "Authorising cTrader account:",
+        account_id,
+        flush=True
+    )
 
     request_message = (
         ProtoOAAccountAuthReq()
@@ -857,12 +716,16 @@ def authorize_account(
 
 
 # ============================================================
-# REQUEST SYMBOL LIST
+# REQUEST SYMBOLS
 # ============================================================
 
-def request_symbol_list(
-    account_id
-):
+def request_symbol_list(account_id):
+
+    print(
+        "Requesting symbols for account:",
+        account_id,
+        flush=True
+    )
 
     request_message = (
         ProtoOASymbolsListReq()
@@ -872,9 +735,7 @@ def request_symbol_list(
         account_id
     )
 
-    request_message.includeArchivedSymbols = (
-        False
-    )
+    request_message.includeArchivedSymbols = False
 
     deferred = ctrader_client.send(
         request_message
@@ -886,43 +747,23 @@ def request_symbol_list(
 
 
 # ============================================================
-# HANDLE CTRADER MESSAGES
+# MESSAGE HANDLER
 # ============================================================
 
-def on_ctrader_message(
-    client,
-    message
-):
+def on_ctrader_message(client, message):
 
     global application_authorized
     global last_message_time
 
     try:
 
-        last_message_time = (
-            time.time()
-        )
+        last_message_time = time.time()
 
-        payload_type = (
-            message.payloadType
-        )
+        payload_type = message.payloadType
 
 
         # ----------------------------------------------------
-        # HEARTBEAT
-        # ----------------------------------------------------
-
-        if (
-            payload_type
-            ==
-            ProtoHeartbeatEvent().payloadType
-        ):
-
-            return
-
-
-        # ----------------------------------------------------
-        # APPLICATION AUTH SUCCESS
+        # APPLICATION AUTH
         # ----------------------------------------------------
 
         if (
@@ -931,12 +772,11 @@ def on_ctrader_message(
             ProtoOAApplicationAuthRes().payloadType
         ):
 
-            application_authorized = (
-                True
-            )
+            application_authorized = True
 
             print(
-                "cTrader application authorised"
+                "CTRADER APPLICATION AUTHORISED",
+                flush=True
             )
 
             if CTRADER_ACCESS_TOKEN:
@@ -945,21 +785,15 @@ def on_ctrader_message(
 
             elif CTRADER_REFRESH_TOKEN:
 
-                print(
-                    "No access token currently in memory - "
-                    "attempting refresh"
-                )
-
-                threading.Thread(
-                    target=refresh_and_request_accounts,
-                    daemon=True
-                ).start()
+                if refresh_ctrader_token():
+                    request_account_list()
 
             else:
 
                 print(
-                    "No cTrader token available. "
-                    "Visit /ctrader/login"
+                    "No access token available - "
+                    "open /ctrader/login",
+                    flush=True
                 )
 
             return
@@ -984,8 +818,9 @@ def on_ctrader_message(
             )
 
             print(
-                "Authorized account count:",
-                len(accounts)
+                "Authorised accounts returned:",
+                len(accounts),
+                flush=True
             )
 
             live_accounts = []
@@ -999,46 +834,36 @@ def on_ctrader_message(
                 )
 
                 if is_live:
-
-                    live_accounts.append(
-                        account
-                    )
+                    live_accounts.append(account)
 
             print(
-                "LIVE account count:",
-                len(live_accounts)
+                "LIVE accounts:",
+                len(live_accounts),
+                flush=True
             )
 
             if not live_accounts:
 
                 send_telegram(
-                    "⚠️ cTrader watcher connected, "
-                    "but no authorised LIVE account "
-                    "was found."
+                    "⚠️ Open API connected but "
+                    "no authorised LIVE account was found."
                 )
 
                 return
 
             for account in live_accounts:
 
-                account_id = int(
-                    account.ctidTraderAccountId
-                )
-
-                print(
-                    "Authorising account:",
-                    account_id
-                )
-
                 authorize_account(
-                    account_id
+                    int(
+                        account.ctidTraderAccountId
+                    )
                 )
 
             return
 
 
         # ----------------------------------------------------
-        # ACCOUNT AUTH SUCCESS
+        # ACCOUNT AUTH
         # ----------------------------------------------------
 
         if (
@@ -1060,8 +885,9 @@ def on_ctrader_message(
             )
 
             print(
-                "Account authorised:",
-                account_id
+                "ACCOUNT AUTHORISED:",
+                account_id,
+                flush=True
             )
 
             request_symbol_list(
@@ -1095,59 +921,54 @@ def on_ctrader_message(
 
                 account_symbols[
                     int(symbol.symbolId)
-                ] = (
-                    symbol.symbolName
-                )
+                ] = symbol.symbolName
 
             symbol_maps[
                 account_id
             ] = account_symbols
 
             print(
-                "Symbol list loaded for account:",
+                "SYMBOL MAP LOADED:",
                 account_id,
-                "- symbols:",
-                len(account_symbols)
+                "symbols:",
+                len(account_symbols),
+                flush=True
             )
 
             btc_found = [
                 name
-                for name
-                in account_symbols.values()
-                if normalize_symbol(
-                    name
-                ).startswith(
+                for name in account_symbols.values()
+                if normalize_symbol(name).startswith(
                     "BTCUSD"
                 )
             ]
 
             xau_found = [
                 name
-                for name
-                in account_symbols.values()
-                if normalize_symbol(
-                    name
-                ).startswith(
+                for name in account_symbols.values()
+                if normalize_symbol(name).startswith(
                     "XAUUSD"
                 )
             ]
 
             print(
-                "BTCUSD matches:",
-                btc_found
+                "BTCUSD symbols:",
+                btc_found,
+                flush=True
             )
 
             print(
-                "XAUUSD matches:",
-                xau_found
+                "XAUUSD symbols:",
+                xau_found,
+                flush=True
             )
 
             send_telegram(
-                "✅ cTrader trade watcher ACTIVE\n\n"
-                "Watching:\n"
-                "• BTCUSD MomentumTrend bots\n"
-                "• XAUUSD MomentumHunter bots\n\n"
-                "Waiting for new filled trades."
+                "✅ cTrader TRADE WATCHER ACTIVE\n\n"
+                "Watching cloud trades from:\n"
+                "• BTCUSD MomentumTrend\n"
+                "• XAUUSD MomentumHunter\n\n"
+                "Waiting for a new trade."
             )
 
             return
@@ -1174,101 +995,35 @@ def on_ctrader_message(
             return
 
 
-        # ----------------------------------------------------
-        # CTRADER ERROR RESPONSE
-        # ----------------------------------------------------
-
-        try:
-
-            extracted = (
-                Protobuf.extract(
-                    message
-                )
-            )
-
-            print(
-                "Unhandled cTrader message:",
-                type(extracted).__name__
-            )
-
-        except Exception:
-
-            pass
-
     except Exception as exc:
 
         print(
             "Message processing error:",
-            str(exc)
+            repr(exc),
+            flush=True
         )
 
 
 # ============================================================
-# REFRESH TOKEN AND REQUEST ACCOUNTS
+# EXECUTION HANDLER
 # ============================================================
 
-def refresh_and_request_accounts():
-
-    success = (
-        refresh_ctrader_token()
-    )
-
-    if not success:
-
-        send_telegram(
-            "⚠️ cTrader watcher needs authorisation.\n\n"
-            "Open /ctrader/login on the Render service."
-        )
-
-        return
+def handle_execution_event(event):
 
     try:
-
-        reactor.callFromThread(
-            request_account_list
-        )
-
-    except Exception as exc:
-
-        print(
-            "Refresh/request account error:",
-            str(exc)
-        )
-
-
-# ============================================================
-# EXECUTION EVENT HANDLER
-# ============================================================
-
-def handle_execution_event(
-    event
-):
-
-    try:
-
-        # ----------------------------------------------------
-        # ONLY FILLED ORDERS
-        # ----------------------------------------------------
 
         if (
             event.executionType
-            !=
-            ProtoOAExecutionType.ORDER_FILLED
+            != ProtoOAExecutionType.ORDER_FILLED
         ):
 
             return
 
-
-        # ----------------------------------------------------
-        # DEAL MUST EXIST
-        # ----------------------------------------------------
-
-        if not event.HasField(
-            "deal"
-        ):
+        if not event.HasField("deal"):
 
             print(
-                "ORDER_FILLED event has no deal"
+                "Filled event without deal",
+                flush=True
             )
 
             return
@@ -1277,7 +1032,7 @@ def handle_execution_event(
 
 
         # ----------------------------------------------------
-        # IGNORE CLOSING DEALS
+        # IGNORE CLOSING DEAL
         # ----------------------------------------------------
 
         try:
@@ -1288,13 +1043,13 @@ def handle_execution_event(
 
                 print(
                     "Closing deal ignored:",
-                    deal.dealId
+                    deal.dealId,
+                    flush=True
                 )
 
                 return
 
         except Exception:
-
             pass
 
 
@@ -1308,16 +1063,7 @@ def handle_execution_event(
 
         with state_lock:
 
-            if (
-                deal_id
-                in notified_deals
-            ):
-
-                print(
-                    "Duplicate deal ignored:",
-                    deal_id
-                )
-
+            if deal_id in notified_deals:
                 return
 
             notified_deals.add(
@@ -1325,17 +1071,13 @@ def handle_execution_event(
             )
 
 
-        # ----------------------------------------------------
-        # ACCOUNT
-        # ----------------------------------------------------
-
         account_id = int(
             event.ctidTraderAccountId
         )
 
 
         # ----------------------------------------------------
-        # LABEL
+        # BOT LABEL
         # ----------------------------------------------------
 
         label = ""
@@ -1349,16 +1091,12 @@ def handle_execution_event(
             ) or ""
 
         except Exception:
+            pass
 
-            label = ""
 
-
-        # Most commonly, label is available from order tradeData.
         if (
             not label
-            and event.HasField(
-                "order"
-            )
+            and event.HasField("order")
         ):
 
             try:
@@ -1370,22 +1108,28 @@ def handle_execution_event(
                 ) or ""
 
             except Exception:
+                pass
 
-                label = ""
+
+        print(
+            "FILLED DEAL:",
+            deal_id,
+            "LABEL:",
+            label,
+            flush=True
+        )
 
 
         # ----------------------------------------------------
-        # WATCHED BOT FILTER
+        # WATCH ONLY OUR BOT FAMILIES
         # ----------------------------------------------------
 
-        if not label_is_watched(
-            label
-        ):
+        if not label_is_watched(label):
 
             print(
-                "Filled deal ignored - "
-                "label not watched:",
-                label
+                "Ignored - label not watched:",
+                label,
+                flush=True
             )
 
             return
@@ -1401,26 +1145,15 @@ def handle_execution_event(
 
         symbol_name = (
             symbol_maps
-            .get(
-                account_id,
-                {}
-            )
+            .get(account_id, {})
             .get(
                 symbol_id,
-                "Symbol "
-                + str(symbol_id)
+                "Symbol " + str(symbol_id)
             )
         )
 
-
-        # ----------------------------------------------------
-        # SYMBOL SAFETY FILTER
-        # ----------------------------------------------------
-
-        normalized_symbol = (
-            normalize_symbol(
-                symbol_name
-            )
+        normalized_symbol = normalize_symbol(
+            symbol_name
         )
 
         if not (
@@ -1434,39 +1167,32 @@ def handle_execution_event(
         ):
 
             print(
-                "Filled deal ignored - "
-                "symbol not watched:",
-                symbol_name
+                "Ignored - symbol not watched:",
+                symbol_name,
+                flush=True
             )
 
             return
 
 
         # ----------------------------------------------------
-        # BUY / SELL
+        # SIDE
         # ----------------------------------------------------
 
         try:
 
-            side = (
-                ProtoOATradeSide.Name(
-                    deal.tradeSide
-                )
+            side = ProtoOATradeSide.Name(
+                deal.tradeSide
             )
 
         except Exception:
 
-            if (
-                deal.tradeSide
-                ==
-                ProtoOATradeSide.BUY
-            ):
-
-                side = "BUY"
-
-            else:
-
-                side = "SELL"
+            side = (
+                "BUY"
+                if deal.tradeSide
+                == ProtoOATradeSide.BUY
+                else "SELL"
+            )
 
 
         # ----------------------------------------------------
@@ -1476,9 +1202,7 @@ def handle_execution_event(
         try:
 
             volume = (
-                float(
-                    deal.filledVolume
-                )
+                float(deal.filledVolume)
                 / 100.0
             )
 
@@ -1488,7 +1212,7 @@ def handle_execution_event(
 
 
         # ----------------------------------------------------
-        # EXECUTION PRICE
+        # PRICE
         # ----------------------------------------------------
 
         try:
@@ -1505,16 +1229,12 @@ def handle_execution_event(
 
         except Exception:
 
-            price_text = (
-                "N/A"
-            )
+            price_text = "N/A"
 
 
         # ----------------------------------------------------
-        # POSITION ID
+        # POSITION
         # ----------------------------------------------------
-
-        position_id = "N/A"
 
         try:
 
@@ -1524,11 +1244,11 @@ def handle_execution_event(
 
         except Exception:
 
-            pass
+            position_id = "N/A"
 
 
         # ----------------------------------------------------
-        # TELEGRAM ALERT
+        # ALERT
         # ----------------------------------------------------
 
         telegram_message = (
@@ -1543,37 +1263,20 @@ def handle_execution_event(
         )
 
         print(
-            "NEW WATCHED TRADE:"
+            telegram_message,
+            flush=True
         )
 
-        print(
+        send_telegram(
             telegram_message
         )
-
-        success, result = (
-            send_telegram(
-                telegram_message
-            )
-        )
-
-        if success:
-
-            print(
-                "Trade notification completed"
-            )
-
-        else:
-
-            print(
-                "Trade notification FAILED:",
-                result
-            )
 
     except Exception as exc:
 
         print(
             "Execution handler error:",
-            str(exc)
+            repr(exc),
+            flush=True
         )
 
 
@@ -1581,12 +1284,9 @@ def handle_execution_event(
 # HELPERS
 # ============================================================
 
-def normalize_symbol(
-    symbol_name
-):
+def normalize_symbol(symbol_name):
 
     if not symbol_name:
-
         return ""
 
     return (
@@ -1601,22 +1301,14 @@ def normalize_symbol(
     )
 
 
-def label_is_watched(
-    label
-):
+def label_is_watched(label):
 
     if not label:
-
         return False
 
-    for prefix in (
-        WATCHED_LABEL_PREFIXES
-    ):
+    for prefix in WATCHED_LABEL_PREFIXES:
 
-        if label.startswith(
-            prefix
-        ):
-
+        if label.startswith(prefix):
             return True
 
     return False
@@ -1632,30 +1324,74 @@ def label_is_watched(
 )
 def ctrader_status():
 
+    thread_alive = (
+        watcher_thread is not None
+        and watcher_thread.is_alive()
+    )
+
     return jsonify({
 
         "service":
             "running",
 
         "client_id_configured":
-            bool(
-                CTRADER_CLIENT_ID
-            ),
+            bool(CTRADER_CLIENT_ID),
 
         "client_secret_configured":
-            bool(
-                CTRADER_CLIENT_SECRET
-            ),
+            bool(CTRADER_CLIENT_SECRET),
 
         "access_token_received":
-            bool(
-                CTRADER_ACCESS_TOKEN
-            ),
+            bool(CTRADER_ACCESS_TOKEN),
 
         "refresh_token_available":
-            bool(
-                CTRADER_REFRESH_TOKEN
-            ),
+            bool(CTRADER_REFRESH_TOKEN),
+
+        "watcher_started":
+            watcher_started,
+
+        "watcher_thread_alive":
+            thread_alive,
+
+        "watcher_connected":
+            watcher_connected,
+
+        "application_authorized":
+            application_authorized,
+
+        "authorized_accounts":
+            len(authorized_accounts),
+
+        "symbol_maps_loaded":
+            len(symbol_maps),
+
+        "notified_deals":
+            len(notified_deals),
+
+        "last_connection_time":
+            last_connection_time,
+
+        "last_message_time":
+            last_message_time,
+
+        "last_error":
+            last_error,
+
+        "watching_labels":
+            list(WATCHED_LABEL_PREFIXES)
+    })
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.route("/health", methods=["GET"])
+def health():
+
+    return jsonify({
+
+        "service":
+            "running",
 
         "watcher_started":
             watcher_started,
@@ -1666,68 +1402,11 @@ def ctrader_status():
         "application_authorized":
             application_authorized,
 
-        "authorized_accounts":
-            len(
-                authorized_accounts
-            ),
-
-        "symbol_maps_loaded":
-            len(
-                symbol_maps
-            ),
-
-        "notified_deals":
-            len(
-                notified_deals
-            ),
-
-        "last_connection_time":
-            last_connection_time,
-
-        "last_message_time":
-            last_message_time,
-
-        "last_heartbeat_time":
-            last_heartbeat_time,
-
-        "watching_labels":
-            list(
-                WATCHED_LABEL_PREFIXES
-            )
-    })
-
-
-# ============================================================
-# HEALTH
-# ============================================================
-
-@app.route(
-    "/health",
-    methods=["GET"]
-)
-def health():
-
-    healthy = (
-        watcher_connected
-        and application_authorized
-    )
-
-    return jsonify({
-
-        "service":
-            "running",
-
-        "ctrader_watcher_started":
-            watcher_started,
-
-        "ctrader_connected":
-            watcher_connected,
-
-        "application_authorized":
-            application_authorized,
-
         "healthy":
-            healthy
+            (
+                watcher_connected
+                and application_authorized
+            )
     })
 
 
@@ -1738,15 +1417,18 @@ def health():
 def startup():
 
     print(
-        "============================================"
+        "========================================",
+        flush=True
     )
 
     print(
-        "cTrader Notification Service starting"
+        "cTrader Notification Service starting",
+        flush=True
     )
 
     print(
-        "============================================"
+        "========================================",
+        flush=True
     )
 
     print(
@@ -1754,58 +1436,40 @@ def startup():
         bool(
             TELEGRAM_BOT_TOKEN
             and TELEGRAM_CHAT_ID
-        )
+        ),
+        flush=True
     )
 
     print(
         "cTrader Client ID configured:",
-        bool(
-            CTRADER_CLIENT_ID
-        )
+        bool(CTRADER_CLIENT_ID),
+        flush=True
     )
 
     print(
         "cTrader Client Secret configured:",
-        bool(
-            CTRADER_CLIENT_SECRET
-        )
+        bool(CTRADER_CLIENT_SECRET),
+        flush=True
     )
 
     print(
         "cTrader Refresh Token configured:",
-        bool(
-            CTRADER_REFRESH_TOKEN
-        )
+        bool(CTRADER_REFRESH_TOKEN),
+        flush=True
     )
 
 
-    # --------------------------------------------------------
-    # IF REFRESH TOKEN EXISTS:
-    # Try to obtain a fresh access token automatically.
-    # --------------------------------------------------------
+    # If a permanent refresh token has been placed in
+    # Render's environment, try to authenticate automatically.
 
     if CTRADER_REFRESH_TOKEN:
 
-        success = (
-            refresh_ctrader_token()
-        )
-
-        if success:
-
-            print(
-                "Automatic cTrader authentication successful"
-            )
-
-        else:
-
-            print(
-                "Automatic token refresh failed"
-            )
+        refresh_ctrader_token()
 
 
-    # --------------------------------------------------------
-    # START OPEN API CONNECTION
-    # --------------------------------------------------------
+    # Start Open API regardless of whether an account token
+    # currently exists. Application authentication can still
+    # establish the connection.
 
     if (
         CTRADER_CLIENT_ID
@@ -1817,20 +1481,20 @@ def startup():
     else:
 
         print(
-            "cTrader credentials missing - "
-            "watcher not started"
+            "cTrader credentials missing",
+            flush=True
         )
 
 
 # ============================================================
-# RUN STARTUP ON MODULE LOAD
+# RUN STARTUP
 # ============================================================
 
 startup()
 
 
 # ============================================================
-# LOCAL RUN
+# LOCAL FLASK
 # ============================================================
 
 if __name__ == "__main__":
