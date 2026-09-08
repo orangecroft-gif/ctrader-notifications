@@ -1,16 +1,25 @@
 import os
 import threading
+import time
 import requests
 
 from flask import Flask, request, jsonify, redirect
 
 from ctrader_open_api import Client, Protobuf, TcpProtocol, EndPoints
-from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import *
+
+from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import (
+    ProtoHeartbeatEvent
+)
+
 from ctrader_open_api.messages.OpenApiMessages_pb2 import *
 from ctrader_open_api.messages.OpenApiModelMessages_pb2 import *
 
 from twisted.internet import reactor
 
+
+# ============================================================
+# FLASK
+# ============================================================
 
 app = Flask(__name__)
 
@@ -24,6 +33,20 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 CTRADER_CLIENT_ID = os.environ.get("CTRADER_CLIENT_ID")
 CTRADER_CLIENT_SECRET = os.environ.get("CTRADER_CLIENT_SECRET")
+
+# Optional.
+#
+# Once you have authorised cTrader, you can place your refresh
+# token in Render as:
+#
+# CTRADER_REFRESH_TOKEN
+#
+# This allows the service to try reconnecting automatically
+# after a Render restart.
+#
+CTRADER_REFRESH_TOKEN_ENV = os.environ.get(
+    "CTRADER_REFRESH_TOKEN"
+)
 
 CTRADER_REDIRECT_URI = os.environ.get(
     "CTRADER_REDIRECT_URI",
@@ -42,14 +65,6 @@ CTRADER_TOKEN_URL = (
 # ============================================================
 # BOT LABEL PREFIXES TO WATCH
 # ============================================================
-#
-# These deliberately match all later versions of the bots,
-# provided the beginning of the label remains the same.
-#
-# Examples:
-# BTCUSD_MomentumTrend_V7_6
-# XAUUSD_MomentumHunter_V3
-#
 
 WATCHED_LABEL_PREFIXES = (
     "BTCUSD_MomentumTrend",
@@ -62,26 +77,25 @@ WATCHED_LABEL_PREFIXES = (
 # ============================================================
 
 CTRADER_ACCESS_TOKEN = None
-CTRADER_REFRESH_TOKEN = None
+CTRADER_REFRESH_TOKEN = CTRADER_REFRESH_TOKEN_ENV
 
 ctrader_client = None
+
 watcher_thread = None
 watcher_started = False
 watcher_connected = False
 
+application_authorized = False
+
 authorized_accounts = set()
 
-# Symbol map is stored separately for each cTrader account.
-# Format:
-# {
-#     account_id: {
-#         symbol_id: "BTCUSD"
-#     }
-# }
 symbol_maps = {}
 
-# Used to stop duplicate Telegram alerts for the same deal.
 notified_deals = set()
+
+last_message_time = None
+last_heartbeat_time = None
+last_connection_time = None
 
 state_lock = threading.Lock()
 
@@ -93,12 +107,22 @@ state_lock = threading.Lock()
 def send_telegram(message):
 
     if not TELEGRAM_BOT_TOKEN:
+
         print("TELEGRAM_BOT_TOKEN missing")
-        return False, "TELEGRAM_BOT_TOKEN missing"
+
+        return (
+            False,
+            "TELEGRAM_BOT_TOKEN missing"
+        )
 
     if not TELEGRAM_CHAT_ID:
+
         print("TELEGRAM_CHAT_ID missing")
-        return False, "TELEGRAM_CHAT_ID missing"
+
+        return (
+            False,
+            "TELEGRAM_CHAT_ID missing"
+        )
 
     url = (
         "https://api.telegram.org/bot"
@@ -121,9 +145,14 @@ def send_telegram(message):
 
         if response.ok:
 
-            print("Telegram notification sent")
+            print(
+                "Telegram notification sent"
+            )
 
-            return True, "Notification sent"
+            return (
+                True,
+                "Notification sent"
+            )
 
         error_text = (
             "Telegram error "
@@ -134,7 +163,10 @@ def send_telegram(message):
 
         print(error_text)
 
-        return False, error_text
+        return (
+            False,
+            error_text
+        )
 
     except Exception as exc:
 
@@ -143,7 +175,10 @@ def send_telegram(message):
             str(exc)
         )
 
-        return False, str(exc)
+        return (
+            False,
+            str(exc)
+        )
 
 
 # ============================================================
@@ -152,6 +187,7 @@ def send_telegram(message):
 
 @app.route("/", methods=["GET"])
 def home():
+
     return (
         "cTrader notification service is running",
         200
@@ -159,28 +195,32 @@ def home():
 
 
 # ============================================================
-# TEST TELEGRAM NOTIFICATION
+# TEST TELEGRAM
 # ============================================================
 
 @app.route("/test", methods=["GET"])
 def test_notification():
+
     success, result = send_telegram(
-        "TEST: cTrader notification service is working"
+        "✅ TEST: cTrader notification service is working"
     )
 
     if success:
+
         return (
             "Test notification sent successfully",
             200
         )
 
     return (
-        "Test notification failed: " + str(result),
+        "Test notification failed: "
+        + str(result),
         500
     )
 
+
 # ============================================================
-# EXISTING NOTIFY ENDPOINT
+# LEGACY /notify ENDPOINT
 # ============================================================
 
 @app.route("/notify", methods=["POST"])
@@ -192,13 +232,16 @@ def notify():
             silent=True
         ) or {}
 
-        message = data.get("message")
+        message = data.get(
+            "message"
+        )
 
         if not message:
 
             return jsonify({
                 "success": False,
-                "message": "No message supplied"
+                "message":
+                    "No message supplied"
             }), 400
 
         success, result = send_telegram(
@@ -226,10 +269,13 @@ def notify():
 
 
 # ============================================================
-# CTRADER OAUTH LOGIN
+# CTRADER LOGIN
 # ============================================================
 
-@app.route("/ctrader/login", methods=["GET"])
+@app.route(
+    "/ctrader/login",
+    methods=["GET"]
+)
 def ctrader_login():
 
     if not CTRADER_CLIENT_ID:
@@ -240,10 +286,17 @@ def ctrader_login():
         )
 
     params = {
-        "client_id": CTRADER_CLIENT_ID,
-        "redirect_uri": CTRADER_REDIRECT_URI,
-        "scope": "accounts",
-        "product": "web"
+        "client_id":
+            CTRADER_CLIENT_ID,
+
+        "redirect_uri":
+            CTRADER_REDIRECT_URI,
+
+        "scope":
+            "accounts",
+
+        "product":
+            "web"
     }
 
     prepared = requests.Request(
@@ -261,13 +314,18 @@ def ctrader_login():
 # CTRADER OAUTH CALLBACK
 # ============================================================
 
-@app.route("/callback", methods=["GET"])
+@app.route(
+    "/callback",
+    methods=["GET"]
+)
 def ctrader_callback():
 
     global CTRADER_ACCESS_TOKEN
     global CTRADER_REFRESH_TOKEN
 
-    code = request.args.get("code")
+    code = request.args.get(
+        "code"
+    )
 
     if not code:
 
@@ -331,28 +389,42 @@ def ctrader_callback():
             )
 
             return (
-                "cTrader token exchange failed.",
+                "cTrader token exchange failed.<br><br>"
+                + str(data),
                 400
             )
 
-        CTRADER_ACCESS_TOKEN = access_token
-        CTRADER_REFRESH_TOKEN = refresh_token
+        CTRADER_ACCESS_TOKEN = (
+            access_token
+        )
+
+        if refresh_token:
+
+            CTRADER_REFRESH_TOKEN = (
+                refresh_token
+            )
 
         print(
             "cTrader OAuth token received"
         )
 
+        print(
+            "Refresh token received:",
+            bool(
+                CTRADER_REFRESH_TOKEN
+            )
+        )
+
         start_ctrader_watcher()
 
         send_telegram(
-            "✅ cTrader Open API connected\n\n"
-            "Trade watcher starting.\n"
-            "Access: VIEW ONLY"
+            "✅ cTrader Open API authorised\n\n"
+            "Trade watcher is starting.\n"
+            "Access: account monitoring"
         )
 
         return (
             "<h2>cTrader connected successfully</h2>"
-            "<p>View-only account access has been authorised.</p>"
             "<p>The trade watcher is starting.</p>"
             "<p>You can close this page.</p>",
             200
@@ -373,6 +445,108 @@ def ctrader_callback():
 
 
 # ============================================================
+# REFRESH CTRADER ACCESS TOKEN
+# ============================================================
+
+def refresh_ctrader_token():
+
+    global CTRADER_ACCESS_TOKEN
+    global CTRADER_REFRESH_TOKEN
+
+    if not CTRADER_REFRESH_TOKEN:
+
+        print(
+            "No cTrader refresh token available"
+        )
+
+        return False
+
+    if not CTRADER_CLIENT_ID:
+
+        print(
+            "CTRADER_CLIENT_ID missing"
+        )
+
+        return False
+
+    if not CTRADER_CLIENT_SECRET:
+
+        print(
+            "CTRADER_CLIENT_SECRET missing"
+        )
+
+        return False
+
+    try:
+
+        print(
+            "Refreshing cTrader access token..."
+        )
+
+        response = requests.get(
+            CTRADER_TOKEN_URL,
+            params={
+                "grant_type":
+                    "refresh_token",
+
+                "refresh_token":
+                    CTRADER_REFRESH_TOKEN,
+
+                "client_id":
+                    CTRADER_CLIENT_ID,
+
+                "client_secret":
+                    CTRADER_CLIENT_SECRET
+            },
+            timeout=20
+        )
+
+        data = response.json()
+
+        new_access_token = data.get(
+            "accessToken"
+        )
+
+        new_refresh_token = data.get(
+            "refreshToken"
+        )
+
+        if not new_access_token:
+
+            print(
+                "cTrader token refresh failed:",
+                data
+            )
+
+            return False
+
+        CTRADER_ACCESS_TOKEN = (
+            new_access_token
+        )
+
+        if new_refresh_token:
+
+            CTRADER_REFRESH_TOKEN = (
+                new_refresh_token
+            )
+
+        print(
+            "cTrader access token refreshed successfully"
+        )
+
+        return True
+
+    except Exception as exc:
+
+        print(
+            "Token refresh exception:",
+            str(exc)
+        )
+
+        return False
+
+
+# ============================================================
 # START CTRADER WATCHER
 # ============================================================
 
@@ -386,22 +560,27 @@ def start_ctrader_watcher():
         if watcher_started:
 
             print(
-                "Watcher already started - "
-                "reauthorising with new token"
+                "Watcher already started"
             )
 
-            try:
+            if (
+                ctrader_client
+                and watcher_connected
+                and CTRADER_ACCESS_TOKEN
+            ):
 
-                reactor.callFromThread(
-                    request_account_list
-                )
+                try:
 
-            except Exception as exc:
+                    reactor.callFromThread(
+                        request_account_list
+                    )
 
-                print(
-                    "Reauthorisation error:",
-                    str(exc)
-                )
+                except Exception as exc:
+
+                    print(
+                        "Account list restart error:",
+                        str(exc)
+                    )
 
             return
 
@@ -433,8 +612,13 @@ def run_ctrader_watcher():
             "Connecting to cTrader LIVE Open API..."
         )
 
-        host = EndPoints.PROTOBUF_LIVE_HOST
-        port = EndPoints.PROTOBUF_PORT
+        host = (
+            EndPoints.PROTOBUF_LIVE_HOST
+        )
+
+        port = (
+            EndPoints.PROTOBUF_PORT
+        )
 
         ctrader_client = Client(
             host,
@@ -457,7 +641,12 @@ def run_ctrader_watcher():
         ctrader_client.startService()
 
         print(
-            "cTrader service started"
+            "cTrader client service started"
+        )
+
+        reactor.callLater(
+            10,
+            heartbeat_loop
         )
 
         reactor.run(
@@ -479,8 +668,13 @@ def run_ctrader_watcher():
 def on_ctrader_connected(client):
 
     global watcher_connected
+    global last_connection_time
 
     watcher_connected = True
+
+    last_connection_time = (
+        time.time()
+    )
 
     print(
         "Connected to cTrader Open API"
@@ -517,8 +711,10 @@ def on_ctrader_disconnected(
 ):
 
     global watcher_connected
+    global application_authorized
 
     watcher_connected = False
+    application_authorized = False
 
     print(
         "cTrader disconnected:",
@@ -539,7 +735,59 @@ def on_ctrader_error(failure):
 
 
 # ============================================================
-# REQUEST AUTHORIZED ACCOUNT LIST
+# HEARTBEAT
+# ============================================================
+
+def heartbeat_loop():
+
+    global last_heartbeat_time
+
+    try:
+
+        if (
+            ctrader_client
+            and watcher_connected
+        ):
+
+            heartbeat = (
+                ProtoHeartbeatEvent()
+            )
+
+            deferred = (
+                ctrader_client.send(
+                    heartbeat
+                )
+            )
+
+            deferred.addErrback(
+                on_ctrader_error
+            )
+
+            last_heartbeat_time = (
+                time.time()
+            )
+
+            print(
+                "cTrader heartbeat sent"
+            )
+
+    except Exception as exc:
+
+        print(
+            "Heartbeat error:",
+            str(exc)
+        )
+
+    finally:
+
+        reactor.callLater(
+            10,
+            heartbeat_loop
+        )
+
+
+# ============================================================
+# REQUEST ACCOUNT LIST
 # ============================================================
 
 def request_account_list():
@@ -580,7 +828,7 @@ def request_account_list():
 
 
 # ============================================================
-# AUTHORIZE TRADING ACCOUNT - VIEW ONLY TOKEN
+# AUTHORIZE ACCOUNT
 # ============================================================
 
 def authorize_account(
@@ -609,7 +857,7 @@ def authorize_account(
 
 
 # ============================================================
-# REQUEST ACCOUNT SYMBOL LIST
+# REQUEST SYMBOL LIST
 # ============================================================
 
 def request_symbol_list(
@@ -624,7 +872,9 @@ def request_symbol_list(
         account_id
     )
 
-    request_message.includeArchivedSymbols = False
+    request_message.includeArchivedSymbols = (
+        False
+    )
 
     deferred = ctrader_client.send(
         request_message
@@ -636,7 +886,7 @@ def request_symbol_list(
 
 
 # ============================================================
-# HANDLE ALL CTRADER MESSAGES
+# HANDLE CTRADER MESSAGES
 # ============================================================
 
 def on_ctrader_message(
@@ -644,9 +894,32 @@ def on_ctrader_message(
     message
 ):
 
+    global application_authorized
+    global last_message_time
+
     try:
 
-        payload_type = message.payloadType
+        last_message_time = (
+            time.time()
+        )
+
+        payload_type = (
+            message.payloadType
+        )
+
+
+        # ----------------------------------------------------
+        # HEARTBEAT
+        # ----------------------------------------------------
+
+        if (
+            payload_type
+            ==
+            ProtoHeartbeatEvent().payloadType
+        ):
+
+            return
+
 
         # ----------------------------------------------------
         # APPLICATION AUTH SUCCESS
@@ -658,17 +931,42 @@ def on_ctrader_message(
             ProtoOAApplicationAuthRes().payloadType
         ):
 
+            application_authorized = (
+                True
+            )
+
             print(
                 "cTrader application authorised"
             )
 
-            request_account_list()
+            if CTRADER_ACCESS_TOKEN:
+
+                request_account_list()
+
+            elif CTRADER_REFRESH_TOKEN:
+
+                print(
+                    "No access token currently in memory - "
+                    "attempting refresh"
+                )
+
+                threading.Thread(
+                    target=refresh_and_request_accounts,
+                    daemon=True
+                ).start()
+
+            else:
+
+                print(
+                    "No cTrader token available. "
+                    "Visit /ctrader/login"
+                )
 
             return
 
 
         # ----------------------------------------------------
-        # ACCOUNT LIST RECEIVED
+        # ACCOUNT LIST
         # ----------------------------------------------------
 
         if (
@@ -706,12 +1004,12 @@ def on_ctrader_message(
                         account
                     )
 
-            if not live_accounts:
+            print(
+                "LIVE account count:",
+                len(live_accounts)
+            )
 
-                print(
-                    "No LIVE cTrader accounts "
-                    "were authorised"
-                )
+            if not live_accounts:
 
                 send_telegram(
                     "⚠️ cTrader watcher connected, "
@@ -774,7 +1072,7 @@ def on_ctrader_message(
 
 
         # ----------------------------------------------------
-        # SYMBOL LIST RECEIVED
+        # SYMBOL LIST
         # ----------------------------------------------------
 
         if (
@@ -797,7 +1095,9 @@ def on_ctrader_message(
 
                 account_symbols[
                     int(symbol.symbolId)
-                ] = symbol.symbolName
+                ] = (
+                    symbol.symbolName
+                )
 
             symbol_maps[
                 account_id
@@ -814,16 +1114,22 @@ def on_ctrader_message(
                 name
                 for name
                 in account_symbols.values()
-                if normalize_symbol(name)
-                .startswith("BTCUSD")
+                if normalize_symbol(
+                    name
+                ).startswith(
+                    "BTCUSD"
+                )
             ]
 
             xau_found = [
                 name
                 for name
                 in account_symbols.values()
-                if normalize_symbol(name)
-                .startswith("XAUUSD")
+                if normalize_symbol(
+                    name
+                ).startswith(
+                    "XAUUSD"
+                )
             ]
 
             print(
@@ -841,7 +1147,7 @@ def on_ctrader_message(
                 "Watching:\n"
                 "• BTCUSD MomentumTrend bots\n"
                 "• XAUUSD MomentumHunter bots\n\n"
-                "Account access: VIEW ONLY"
+                "Waiting for new filled trades."
             )
 
             return
@@ -867,10 +1173,65 @@ def on_ctrader_message(
 
             return
 
+
+        # ----------------------------------------------------
+        # CTRADER ERROR RESPONSE
+        # ----------------------------------------------------
+
+        try:
+
+            extracted = (
+                Protobuf.extract(
+                    message
+                )
+            )
+
+            print(
+                "Unhandled cTrader message:",
+                type(extracted).__name__
+            )
+
+        except Exception:
+
+            pass
+
     except Exception as exc:
 
         print(
             "Message processing error:",
+            str(exc)
+        )
+
+
+# ============================================================
+# REFRESH TOKEN AND REQUEST ACCOUNTS
+# ============================================================
+
+def refresh_and_request_accounts():
+
+    success = (
+        refresh_ctrader_token()
+    )
+
+    if not success:
+
+        send_telegram(
+            "⚠️ cTrader watcher needs authorisation.\n\n"
+            "Open /ctrader/login on the Render service."
+        )
+
+        return
+
+    try:
+
+        reactor.callFromThread(
+            request_account_list
+        )
+
+    except Exception as exc:
+
+        print(
+            "Refresh/request account error:",
             str(exc)
         )
 
@@ -885,22 +1246,40 @@ def handle_execution_event(
 
     try:
 
-        # We only want a completely filled order.
+        # ----------------------------------------------------
+        # ONLY FILLED ORDERS
+        # ----------------------------------------------------
+
         if (
             event.executionType
-            != ProtoOAExecutionType.ORDER_FILLED
+            !=
+            ProtoOAExecutionType.ORDER_FILLED
         ):
 
             return
 
-        if not event.HasField("deal"):
+
+        # ----------------------------------------------------
+        # DEAL MUST EXIST
+        # ----------------------------------------------------
+
+        if not event.HasField(
+            "deal"
+        ):
+
+            print(
+                "ORDER_FILLED event has no deal"
+            )
 
             return
 
         deal = event.deal
 
-        # A closing deal includes closePositionDetail.
-        # We only want NEW/OPENING deals here.
+
+        # ----------------------------------------------------
+        # IGNORE CLOSING DEALS
+        # ----------------------------------------------------
+
         try:
 
             if deal.HasField(
@@ -929,7 +1308,15 @@ def handle_execution_event(
 
         with state_lock:
 
-            if deal_id in notified_deals:
+            if (
+                deal_id
+                in notified_deals
+            ):
+
+                print(
+                    "Duplicate deal ignored:",
+                    deal_id
+                )
 
                 return
 
@@ -951,17 +1338,27 @@ def handle_execution_event(
         # LABEL
         # ----------------------------------------------------
 
-        label = getattr(
-            deal,
-            "label",
-            ""
-        ) or ""
+        label = ""
+
+        try:
+
+            label = getattr(
+                deal,
+                "label",
+                ""
+            ) or ""
+
+        except Exception:
+
+            label = ""
 
 
-        # If deal label is missing, try order label.
+        # Most commonly, label is available from order tradeData.
         if (
             not label
-            and event.HasField("order")
+            and event.HasField(
+                "order"
+            )
         ):
 
             try:
@@ -970,7 +1367,7 @@ def handle_execution_event(
                     event.order
                     .tradeData
                     .label
-                )
+                ) or ""
 
             except Exception:
 
@@ -978,7 +1375,7 @@ def handle_execution_event(
 
 
         # ----------------------------------------------------
-        # ONLY WATCH OUR TWO CBOT FAMILIES
+        # WATCHED BOT FILTER
         # ----------------------------------------------------
 
         if not label_is_watched(
@@ -1004,16 +1401,20 @@ def handle_execution_event(
 
         symbol_name = (
             symbol_maps
-            .get(account_id, {})
+            .get(
+                account_id,
+                {}
+            )
             .get(
                 symbol_id,
-                "Symbol " + str(symbol_id)
+                "Symbol "
+                + str(symbol_id)
             )
         )
 
 
         # ----------------------------------------------------
-        # EXTRA SYMBOL SAFETY CHECK
+        # SYMBOL SAFETY FILTER
         # ----------------------------------------------------
 
         normalized_symbol = (
@@ -1047,8 +1448,10 @@ def handle_execution_event(
 
         try:
 
-            side = ProtoOATradeSide.Name(
-                deal.tradeSide
+            side = (
+                ProtoOATradeSide.Name(
+                    deal.tradeSide
+                )
             )
 
         except Exception:
@@ -1068,13 +1471,14 @@ def handle_execution_event(
 
         # ----------------------------------------------------
         # VOLUME
-        # cTrader Open API volume is represented in cents.
         # ----------------------------------------------------
 
         try:
 
             volume = (
-                float(deal.filledVolume)
+                float(
+                    deal.filledVolume
+                )
                 / 100.0
             )
 
@@ -1101,11 +1505,30 @@ def handle_execution_event(
 
         except Exception:
 
-            price_text = "N/A"
+            price_text = (
+                "N/A"
+            )
 
 
         # ----------------------------------------------------
-        # TELEGRAM TRADE ALERT
+        # POSITION ID
+        # ----------------------------------------------------
+
+        position_id = "N/A"
+
+        try:
+
+            position_id = str(
+                deal.positionId
+            )
+
+        except Exception:
+
+            pass
+
+
+        # ----------------------------------------------------
+        # TELEGRAM ALERT
         # ----------------------------------------------------
 
         telegram_message = (
@@ -1115,17 +1538,36 @@ def handle_execution_event(
             f"Volume: {volume:g}\n"
             f"Price: {price_text}\n"
             f"Bot: {label}\n"
+            f"Position ID: {position_id}\n"
             f"Deal ID: {deal_id}"
         )
 
         print(
-            "NEW WATCHED TRADE:",
+            "NEW WATCHED TRADE:"
+        )
+
+        print(
             telegram_message
         )
 
-        send_telegram(
-            telegram_message
+        success, result = (
+            send_telegram(
+                telegram_message
+            )
         )
+
+        if success:
+
+            print(
+                "Trade notification completed"
+            )
+
+        else:
+
+            print(
+                "Trade notification FAILED:",
+                result
+            )
 
     except Exception as exc:
 
@@ -1167,7 +1609,9 @@ def label_is_watched(
 
         return False
 
-    for prefix in WATCHED_LABEL_PREFIXES:
+    for prefix in (
+        WATCHED_LABEL_PREFIXES
+    ):
 
         if label.startswith(
             prefix
@@ -1179,7 +1623,7 @@ def label_is_watched(
 
 
 # ============================================================
-# STATUS PAGE
+# STATUS
 # ============================================================
 
 @app.route(
@@ -1189,6 +1633,9 @@ def label_is_watched(
 def ctrader_status():
 
     return jsonify({
+
+        "service":
+            "running",
 
         "client_id_configured":
             bool(
@@ -1205,7 +1652,7 @@ def ctrader_status():
                 CTRADER_ACCESS_TOKEN
             ),
 
-        "refresh_token_received":
+        "refresh_token_available":
             bool(
                 CTRADER_REFRESH_TOKEN
             ),
@@ -1215,6 +1662,9 @@ def ctrader_status():
 
         "watcher_connected":
             watcher_connected,
+
+        "application_authorized":
+            application_authorized,
 
         "authorized_accounts":
             len(
@@ -1231,13 +1681,24 @@ def ctrader_status():
                 notified_deals
             ),
 
-        "access":
-            "VIEW ONLY"
+        "last_connection_time":
+            last_connection_time,
+
+        "last_message_time":
+            last_message_time,
+
+        "last_heartbeat_time":
+            last_heartbeat_time,
+
+        "watching_labels":
+            list(
+                WATCHED_LABEL_PREFIXES
+            )
     })
 
 
 # ============================================================
-# HEALTH CHECK
+# HEALTH
 # ============================================================
 
 @app.route(
@@ -1246,13 +1707,126 @@ def ctrader_status():
 )
 def health():
 
+    healthy = (
+        watcher_connected
+        and application_authorized
+    )
+
     return jsonify({
-        "service": "running",
+
+        "service":
+            "running",
+
         "ctrader_watcher_started":
             watcher_started,
+
         "ctrader_connected":
-            watcher_connected
+            watcher_connected,
+
+        "application_authorized":
+            application_authorized,
+
+        "healthy":
+            healthy
     })
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+def startup():
+
+    print(
+        "============================================"
+    )
+
+    print(
+        "cTrader Notification Service starting"
+    )
+
+    print(
+        "============================================"
+    )
+
+    print(
+        "Telegram configured:",
+        bool(
+            TELEGRAM_BOT_TOKEN
+            and TELEGRAM_CHAT_ID
+        )
+    )
+
+    print(
+        "cTrader Client ID configured:",
+        bool(
+            CTRADER_CLIENT_ID
+        )
+    )
+
+    print(
+        "cTrader Client Secret configured:",
+        bool(
+            CTRADER_CLIENT_SECRET
+        )
+    )
+
+    print(
+        "cTrader Refresh Token configured:",
+        bool(
+            CTRADER_REFRESH_TOKEN
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # IF REFRESH TOKEN EXISTS:
+    # Try to obtain a fresh access token automatically.
+    # --------------------------------------------------------
+
+    if CTRADER_REFRESH_TOKEN:
+
+        success = (
+            refresh_ctrader_token()
+        )
+
+        if success:
+
+            print(
+                "Automatic cTrader authentication successful"
+            )
+
+        else:
+
+            print(
+                "Automatic token refresh failed"
+            )
+
+
+    # --------------------------------------------------------
+    # START OPEN API CONNECTION
+    # --------------------------------------------------------
+
+    if (
+        CTRADER_CLIENT_ID
+        and CTRADER_CLIENT_SECRET
+    ):
+
+        start_ctrader_watcher()
+
+    else:
+
+        print(
+            "cTrader credentials missing - "
+            "watcher not started"
+        )
+
+
+# ============================================================
+# RUN STARTUP ON MODULE LOAD
+# ============================================================
+
+startup()
 
 
 # ============================================================
