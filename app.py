@@ -64,7 +64,8 @@ CTRADER_TOKEN_URL = "https://openapi.ctrader.com/apps/token"
 WATCHED_LABEL_PREFIXES = (
     "BTCUSD_MomentumTrend_V7_6",
     "XAUUSD_Breakout_V1",
-    "XAUUSD_Momentum_V3"
+    "XAUUSD_Momentum_V3",
+    "US30_MomentumTrend_V1"
 )
 
 
